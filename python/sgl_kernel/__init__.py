@@ -20,7 +20,9 @@ from sgl_kernel.attention import (
     merge_state_v2,
 )
 from sgl_kernel.elementwise import (
+    apply_rope_inplace_with_kvcache_xpu,
     apply_rope_with_cos_sin_cache_inplace,
+    store_cache_xpu,
     fused_add_rmsnorm,
     fused_qk_norm_rope,
     fused_qk_rope,

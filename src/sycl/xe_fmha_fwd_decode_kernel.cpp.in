@@ -40,7 +40,8 @@ namespace decode {
 template <>
 void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
+  // Use larger PV inner tile for head_dim >= 512 to reduce VTiles loop iterations
+  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<(@HEAD_DIM@ >= 512) ? 64 : 32>, cute::Int<@PAGE_SIZE@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
 

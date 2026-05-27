@@ -183,6 +183,22 @@ void fused_qk_rope(
     int64_t rotary_dim);
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
+void apply_rope_inplace_with_kvcache_xpu(
+    at::Tensor& query,
+    at::Tensor& key,
+    at::Tensor& value,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    at::Tensor& out_loc,
+    bool is_neox);
+void store_cache_xpu(
+    at::Tensor& k,
+    at::Tensor& v,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    at::Tensor& indices);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
