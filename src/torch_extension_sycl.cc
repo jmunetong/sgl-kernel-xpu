@@ -69,10 +69,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
   m.def(
-      "apply_rope_inplace_with_kvcache_xpu(Tensor(a!) query, Tensor(b!) key, Tensor value, "
+      "apply_rope_inplace_with_kvcache(Tensor(a!) query, Tensor(b!) key, Tensor value, "
       "Tensor(c!) k_cache, Tensor(d!) v_cache, Tensor cos_sin_cache, "
       "Tensor positions, Tensor out_loc, bool is_neox) -> ()");
-  m.impl("apply_rope_inplace_with_kvcache_xpu", torch::kXPU, &at::native::xpu::apply_rope_inplace_with_kvcache_xpu);
+  m.impl("apply_rope_inplace_with_kvcache", torch::kXPU, &at::native::xpu::apply_rope_inplace_with_kvcache);
 
   m.def(
       "store_cache_xpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, "
