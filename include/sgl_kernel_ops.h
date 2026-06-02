@@ -200,6 +200,7 @@ void apply_rope_inplace_with_kvcache(
     at::Tensor& positions,
     at::Tensor& out_loc,
     bool is_neox);
+void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
