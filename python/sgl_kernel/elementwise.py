@@ -215,11 +215,16 @@ def apply_rope_inplace_with_kvcache(
     Parameters
     ----------
     query : torch.Tensor
-        Query tensor, shape: ``(num_tokens, num_q_heads, head_dim)``.
+        Query tensor, shape: ``(num_tokens, num_q_heads, head_dim)``. May be a
+        strided slice of a fused QKV buffer; heads must be packed within a row
+        (``stride(1) == head_dim``) and elements contiguous within a head
+        (``stride(2) == 1``), but rows may be spaced by a larger stride(0).
     key : torch.Tensor
-        Key tensor, shape: ``(num_tokens, num_kv_heads, head_dim)``.
+        Key tensor, shape: ``(num_tokens, num_kv_heads, head_dim)``. Same
+        row-packing rule as ``query``.
     value : torch.Tensor
-        Value tensor, shape: ``(num_tokens, num_kv_heads, head_dim)``.
+        Value tensor, shape: ``(num_tokens, num_kv_heads, head_dim)``. Same
+        row-packing rule as ``query``.
     k_cache : torch.Tensor
         Key cache buffer, shape: ``(cache_size, num_kv_heads * head_dim)``.
     v_cache : torch.Tensor

@@ -3,6 +3,8 @@
 #include <ATen/Parallel.h>
 #include <ATen/core/Array.h>
 
+#include <cstdint>
+
 #include "Utils.h"
 #include "comm/General.h"
 
@@ -559,7 +561,11 @@ struct FusedRopeKVCacheKernel {
     // rotation runs lane-by-lane in fp32 with the same static_cast round-trip as the
     // scalar path, so the result is bit-exact.
     if constexpr (sizeof(scalar_t) == 2 && algo == EmbeddingAlgorithm::RotateHalf) {
-      if ((embed_dim % kVec == 0) && (head_dim_ % kVec == 0)) {
+      // allow_vec_ folds in the row-base alignment check: with strided sources
+      // a row base (source + token_id * row_stride) is only 16-byte aligned
+      // when the row stride keeps it so. embed_dim/head_dim alignment covers
+      // the in-row access; allow_vec_ covers the per-token row offset.
+      if (allow_vec_ && (embed_dim % kVec == 0) && (head_dim_ % kVec == 0)) {
         using elem_t = typename ToSyclElementType<scalar_t>::type;
         using pack_t = sycl::vec<uint32_t, 4>;   // one 16-byte OWord = 8 x 2-byte lanes
         using lane_t = sycl::vec<elem_t, kVec>;  // the same 16 bytes viewed as 8 lanes
@@ -646,12 +652,14 @@ struct FusedRopeKVCacheKernel {
     const float* cos_cache = cos_sin_cache_ + pos * rot_dim_;
     const float* sin_cache = cos_cache + embed_dim;
 
-    // RoPE Q in-place (no cache write)
-    scalar_t* q_base = query_ + token_id * num_q_heads_ * head_dim_;
+    // RoPE Q in-place (no cache write). Source row addressed by q_row_stride_
+    // (may exceed num_q_heads_ * head_dim_ for a sliced fused-QKV buffer).
+    scalar_t* q_base = query_ + token_id * q_row_stride_;
     rope_heads<kEmbedDimT>(q_base, nullptr, num_q_heads_, cos_cache, sin_cache, embed_dim, local_id, local_range);
 
-    // RoPE K in-place + write rotated K to k_cache
-    scalar_t* k_base = key_ + token_id * num_kv_heads_ * head_dim_;
+    // RoPE K in-place + write rotated K to k_cache. K source uses k_row_stride_;
+    // the dense cache row stays packed at num_kv_heads_ * head_dim_.
+    scalar_t* k_base = key_ + token_id * k_row_stride_;
     scalar_t* k_cache_row = k_cache_ + out_idx * num_kv_heads_ * head_dim_;
     rope_heads<kEmbedDimT>(k_base, k_cache_row, num_kv_heads_, cos_cache, sin_cache, embed_dim, local_id, local_range);
 
@@ -669,13 +677,15 @@ struct FusedRopeKVCacheKernel {
     // SYCL_DISPATCH_FLOATING_TYPES surface still instantiates this kernel, but
     // the host TORCH_CHECK rejects float at runtime — keep a scalar fallback
     // here so the float instantiation still compiles.
-    scalar_t* v_base = value_ + token_id * num_kv_heads_ * head_dim_;
+    scalar_t* v_base = value_ + token_id * v_row_stride_;
     scalar_t* v_cache_row = v_cache_ + out_idx * num_kv_heads_ * head_dim_;
     int32_t full_work = num_kv_heads_ * head_dim_;
     if constexpr (sizeof(scalar_t) == 2) {
       using pack_128b_t = sycl::vec<uint32_t, 4>;
       constexpr int kVecLen = 8;  // bf16/half elements per 16-byte pack
-      int32_t vec_count = full_work / kVecLen;
+      // allow_vec_ is false when the V source row stride/base is not 16-byte
+      // aligned (e.g. an oddly-strided slice); fall back to scalar copy then.
+      int32_t vec_count = allow_vec_ ? full_work / kVecLen : 0;
       auto* v_base_p = reinterpret_cast<uint32_t*>(v_base);
       auto* v_cache_p = reinterpret_cast<uint32_t*>(v_cache_row);
       for (int v = local_id; v < vec_count; v += local_range) {
@@ -683,8 +693,8 @@ struct FusedRopeKVCacheKernel {
         tmp.load(v, v_base_p);
         tmp.store(v, v_cache_p);
       }
-      // Tail (only fires if full_work is not a multiple of kVecLen, which the
-      // host TORCH_CHECK forbids — kept for safety).
+      // Tail: scalar copy of whatever the vectorized loop did not cover (the
+      // whole row when allow_vec_ is false, or the unaligned remainder).
       for (int i = vec_count * kVecLen + local_id; i < full_work; i += local_range) {
         v_cache_row[i] = v_base[i];
       }
@@ -718,6 +728,19 @@ struct FusedRopeKVCacheKernel {
   int64_t num_kv_heads_;
   int64_t head_dim_;
   int64_t rot_dim_;
+  // Source row strides (stride(0)) of query/key/value. These need not equal
+  // num_*_heads * head_dim: q/k/v are often per-tensor slices of a fused QKV
+  // buffer (e.g. Gemma), so consecutive token rows are spaced by the wider
+  // qkv row. The heads within a row are still packed at head_dim (inner-row
+  // contiguity is enforced on the host). The dense caches keep their packed
+  // num_kv_heads * head_dim stride.
+  int64_t q_row_stride_;
+  int64_t k_row_stride_;
+  int64_t v_row_stride_;
+  // Whether the 16-byte OWord fast paths are legal: every row base stays
+  // 16-byte aligned. False when a source stride or base pointer breaks
+  // alignment; the scalar paths are then taken. Computed on the host.
+  bool allow_vec_;
 };
 
 void apply_rope_inplace_with_kvcache(
@@ -737,11 +760,21 @@ void apply_rope_inplace_with_kvcache(
   TORCH_CHECK(query.dim() == 3, "query must be 3D [num_tokens, n_heads, head_dim]");
   TORCH_CHECK(key.dim() == 3, "key must be 3D [num_tokens, n_kv_heads, head_dim]");
   TORCH_CHECK(value.dim() == 3, "value must be 3D [num_tokens, n_kv_heads, head_dim]");
-  TORCH_CHECK(query.is_contiguous(), "query must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(key.is_contiguous(), "key must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(value.is_contiguous(), "value must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(k_cache.is_contiguous(), "k_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(v_cache.is_contiguous(), "v_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
+  // q/k/v need not be fully contiguous: they are commonly per-tensor slices of
+  // a fused QKV buffer, so rows are spaced by the wider qkv stride. The kernel
+  // addresses source rows by stride(0) and heads by head_dim, so it only
+  // requires (a) packed heads within a row: stride(1) == head_dim, and
+  // (b) contiguous elements within a head: stride(2) == 1. The dense caches
+  // are still required fully contiguous (the kernel writes them packed).
+  auto require_row_packed = [](const at::Tensor& t, const char* name) {
+    TORCH_CHECK(t.stride(2) == 1, name, " head rows must be contiguous (stride(2) == 1)");
+    TORCH_CHECK(t.stride(1) == t.size(2), name, " heads must be packed within a row (stride(1) == head_dim)");
+  };
+  require_row_packed(query, "query");
+  require_row_packed(key, "key");
+  require_row_packed(value, "value");
+  TORCH_CHECK(k_cache.is_contiguous(), "k_cache must be contiguous because the XPU RoPE kernel writes it packed");
+  TORCH_CHECK(v_cache.is_contiguous(), "v_cache must be contiguous because the XPU RoPE kernel writes it packed");
 
   int64_t num_tokens = query.size(0);
   int64_t num_q_heads = query.size(1);
@@ -799,8 +832,27 @@ void apply_rope_inplace_with_kvcache(
   int64_t max_work = std::max(num_q_heads * rot_dim / 2, num_kv_heads * head_dim);
   int64_t group_size = std::min<int64_t>(std::min<int64_t>(max_work, 512), max_wg_size);
 
+  int64_t q_row_stride = query.stride(0);
+  int64_t k_row_stride = key.stride(0);
+  int64_t v_row_stride = value.stride(0);
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "apply_rope_inplace_with_kvcache", [&]() {
+        // The 16-byte OWord fast paths need every per-token row base 16-byte
+        // aligned. A row base is source_ptr + token_id * row_stride, so it
+        // stays aligned only when both the source base pointer and the row
+        // stride (in bytes) are multiples of 16. For 2-byte scalar_t that means
+        // the element stride must be a multiple of 8. Caches are contiguous, so
+        // only the strided sources can break this; when they do, allow_vec is
+        // false and the kernel takes the scalar paths.
+        constexpr int64_t kVecElems = 16 / sizeof(scalar_t);
+        auto stride_ok = [&](int64_t s) { return (s % kVecElems) == 0; };
+        auto ptr_ok = [&](const scalar_t* p) { return (reinterpret_cast<uintptr_t>(p) % 16) == 0; };
+        bool allow_vec = stride_ok(q_row_stride) && stride_ok(k_row_stride) && stride_ok(v_row_stride) &&
+                         ptr_ok(query.data_ptr<scalar_t>()) && ptr_ok(key.data_ptr<scalar_t>()) &&
+                         ptr_ok(value.data_ptr<scalar_t>()) && ptr_ok(k_cache.data_ptr<scalar_t>()) &&
+                         ptr_ok(v_cache.data_ptr<scalar_t>());
+
         // Build + submit the kernel specialized for a given EmbeddingAlgorithm and a
         // compile-time ROT_DIM (0 = runtime-rot_dim fallback). Generic lambda so the same
         // body covers all five specialized dims plus the fallback without duplication.
@@ -821,6 +873,10 @@ void apply_rope_inplace_with_kvcache(
                 .num_kv_heads_ = num_kv_heads,
                 .head_dim_ = head_dim,
                 .rot_dim_ = rot_dim,
+                .q_row_stride_ = q_row_stride,
+                .k_row_stride_ = k_row_stride,
+                .v_row_stride_ = v_row_stride,
+                .allow_vec_ = allow_vec,
             };
             cgh.parallel_for<decltype(kernel)>(
                 sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
