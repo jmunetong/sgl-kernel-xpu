@@ -199,6 +199,95 @@ def test_fused_rope_kvcache_correctness(
     triton.testing.assert_close(v_cache_ref, v_cache_ker, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("num_q_heads", [8, 16])
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize("dtype", DTYPE_LIST)
+def test_fused_rope_kvcache_strided_qkv(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Q/K/V are non-contiguous slices of a fused QKV buffer.
+
+    This is the Gemma layout: a single qkv projection output is split into
+    q/k/v views, so each has row stride (q_size + 2*kv_size) -- larger than
+    its own num_heads*head_dim -- while heads stay packed within a row. The
+    kernel must address rows by stride(0) and rotate Q/K in-place back into
+    those strided slots. Mirrors the store_cache strided-head-slice case.
+    """
+    batch_size = 271
+    rot_dim = head_dim
+    cache_size = 4096
+
+    q_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv = torch.randn(batch_size, q_size + 2 * kv_size, device=DEVICE, dtype=dtype)
+    q2d, k2d, v2d = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+    # 3D views; non-contiguous across rows (row stride = qkv width), packed heads.
+    q = q2d.view(batch_size, num_q_heads, head_dim)
+    k = k2d.view(batch_size, num_kv_heads, head_dim)
+    v = v2d.view(batch_size, num_kv_heads, head_dim)
+    assert not q.is_contiguous() and q.stride(0) == q_size + 2 * kv_size
+    assert k.stride(1) == head_dim and k.stride(2) == 1
+
+    k_cache = torch.zeros(
+        cache_size, num_kv_heads * head_dim, device=DEVICE, dtype=dtype
+    )
+    v_cache = torch.zeros(
+        cache_size, num_kv_heads * head_dim, device=DEVICE, dtype=dtype
+    )
+    cos_sin_cache = create_cos_sin_cache(rot_dim).float()
+    positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE)
+    out_loc = torch.randperm(cache_size, device=DEVICE, dtype=torch.int64)[:batch_size]
+
+    # Reference operates on independent contiguous copies.
+    q_ref, k_ref, k_cache_ref, v_cache_ref = reference_rope_with_kvcache(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        k_cache,
+        v_cache,
+        cos_sin_cache,
+        positions,
+        out_loc,
+        rot_dim,
+        is_neox,
+    )
+
+    # Kernel operates on a fresh strided qkv buffer (in-place into the slices).
+    qkv_ker = qkv.clone()
+    q_ker, k_ker, v_ker = qkv_ker.split([q_size, kv_size, kv_size], dim=-1)
+    q_ker = q_ker.view(batch_size, num_q_heads, head_dim)
+    k_ker = k_ker.view(batch_size, num_kv_heads, head_dim)
+    v_ker = v_ker.view(batch_size, num_kv_heads, head_dim)
+    k_cache_ker = k_cache.clone()
+    v_cache_ker = v_cache.clone()
+
+    apply_rope_inplace_with_kvcache(
+        q_ker,
+        k_ker,
+        v_ker,
+        k_cache_ker,
+        v_cache_ker,
+        cos_sin_cache,
+        positions,
+        out_loc,
+        is_neox,
+    )
+
+    atol = rtol = 1e-2
+    triton.testing.assert_close(q_ref, q_ker, atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_ref, k_ker, atol=atol, rtol=rtol)
+    triton.testing.assert_close(v_ker, v, atol=atol, rtol=rtol)  # V unchanged
+    triton.testing.assert_close(k_cache_ref, k_cache_ker, atol=atol, rtol=rtol)
+    triton.testing.assert_close(v_cache_ref, v_cache_ker, atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize("dtype", DTYPE_LIST)
 def test_partial_rotary_dim(dtype: torch.dtype) -> None:
     """Test when rot_dim < head_dim."""
