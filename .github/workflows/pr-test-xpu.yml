@@ -67,6 +67,7 @@ jobs:
               python3 bench_moe_sum_reduce.py 2>&1 | tee moe_sum_reduce.log \
               python3 bench_moe_fused_gate.py 2>&1 | tee moe_fused_gate.py.log \
               python3 bench_merge_states_v2.py 2>&1 | tee merge_states.py.log \
+              python3 bench_mrope.py 2>&1 | tee mrope.py.log \
               python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.py.log \
               python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.py.log \
               python3 bench_fused_qk_rope_with_cache.py 2>&1 | tee bench_fused_qk_rope_with_cache.py.log \
@@ -77,6 +78,8 @@ jobs:
               python3 bench_top_k_renorm_probs.py 2>&1 | tee bench_top_k_renorm_probs.py.log \
               python3 bench_hc_split_sinkhorn.py 2>&1 | tee bench_hc_split_sinkhorn.py.log \
               python3 bench_embedding_lora_a_fwd.py.py 2>&1 | tee bench_embedding_lora_a_fwd.py.log \
+              python3 bench_moe_mxfp4_w4a16_gemm.py 2>&1 | tee bench_moe_mxfp4_w4a16_gemm.py.log \
+              python3 bench_fused_experts_mxfp4.py 2>&1 | tee bench_fused_experts_mxfp4.py.log \
             "
 
       - name: Copy logs from container

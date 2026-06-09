@@ -39,14 +39,23 @@ namespace decode {
 
 template <>
 void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
-  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
+  // Decouple the K/V tile width from PAGE_SIZE. The mainloop already supports
+  // tiles_per_page = page_size / get<1>(TileShapeQK) > 1 (see
+  // collective/xe_fmha_fwd_mainloop.hpp get_physical_k_tile / next_tile_idx), so a
+  // page_size=128 page is processed as two KV_TILE=64 tiles. Keeping the tile at 64
+  // fixes SGPerWG = KV_TILE/16 = 4 (vs 8 when tied to page_size=128) and the QK/PV
+  // GEMM tile widths, so page_size=128 costs the same per-work-group register/SLM
+  // footprint as page_size=64 and no longer trips UR_RESULT_ERROR_OUT_OF_RESOURCES.
+  // Requires page_size % KV_TILE == 0, which holds for the supported page sizes {64,128}.
+  constexpr int KV_TILE = @PAGE_SIZE@ < 64 ? @PAGE_SIZE@ : 64;
+  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<KV_TILE>, cute::_64>;
+  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<KV_TILE>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
   // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<KV_TILE / 16>, cute::_1>>;
 
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
